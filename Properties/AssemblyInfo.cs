@@ -10,7 +10,7 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyConfiguration("Retail")]
 [assembly: AssemblyCompany("Future Tech")]
 [assembly: AssemblyProduct("Informer")]
-[assembly: AssemblyCopyright("All rights reserved © 2025")]
+[assembly: AssemblyCopyright("All rights reserved © 2026")]
 [assembly: AssemblyTrademark("Future Tech")]
 [assembly: AssemblyCulture("")]
 
@@ -30,5 +30,5 @@ using System.Runtime.InteropServices;
 //      Редакция
 //
 
-[assembly: AssemblyVersion("1.3.0.0")]
-[assembly: AssemblyFileVersion("1.3.0.0")] 
+[assembly: AssemblyVersion("1.3.1.162")]
+[assembly: AssemblyFileVersion("1.3.1.162")] 

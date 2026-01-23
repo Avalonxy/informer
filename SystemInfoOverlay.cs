@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Drawing.Imaging;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
@@ -21,12 +22,24 @@ namespace Informer
         private FileSystemWatcher configWatcher;
         private Timer configCheckTimer;
         private DateTime lastConfigWriteTime;
+        private DateTime lastFormSaveTime = DateTime.MinValue; // Время последнего сохранения из формы (игнорируем FileSystemWatcher в течение 5 секунд после этого)
+        private DateTime lastConfigUpdateTime = DateTime.MinValue; // Время последнего обновления конфига
+        private DateTime lastInvalidateTime = DateTime.MinValue; // Время последнего вызова Invalidate() для защиты от частых обновлений
+        private volatile bool forceRepaint = false; // Принудительная перерисовка после изменения настроек
+        private string lastSettingsSignature = ""; // Сигнатура настроек для защиты от лишних обновлений
         
         // Кэш для медленных операций
         private string cachedSystemInfo = "";
         private DateTime lastUpdateTime = DateTime.MinValue;
         private readonly object cacheLock = new object();
-        private bool isUpdating = false;
+        private int isUpdating = 0;
+        private readonly Color transparentColor = Color.Magenta;
+        private readonly bool useLayeredWindow = true;
+        private Bitmap cachedBitmap;
+        private readonly object bitmapLock = new object();
+        private readonly object renderLock = new object();
+        private bool renderQueued = false;
+        private string queuedRenderInfo = "";
         
         // Анимация загрузки
         private Timer loadingAnimationTimer;
@@ -45,6 +58,7 @@ namespace Informer
                 // Загрузка настроек
                 ConfigurationManager.RefreshSection("appSettings");
                 Settings.LoadSettings();
+                lastSettingsSignature = GetSettingsSignature();
             }
             catch
             {
@@ -56,8 +70,14 @@ namespace Informer
             this.ShowInTaskbar = false;
             this.TopMost = false;
             this.BackColor = Color.Black;
-            this.TransparencyKey = Color.Black;
+            this.TransparencyKey = useLayeredWindow ? Color.Empty : transparentColor;
             this.StartPosition = FormStartPosition.Manual;
+            this.DoubleBuffered = true;
+            this.SetStyle(ControlStyles.OptimizedDoubleBuffer |
+                          ControlStyles.AllPaintingInWmPaint |
+                          ControlStyles.UserPaint |
+                          (useLayeredWindow ? ControlStyles.Opaque : 0), true);
+            this.UpdateStyles();
             
             // Проверяем размер окна (должен быть больше 0)
             int width = Settings.WindowWidth > 0 ? Settings.WindowWidth : 300;
@@ -77,9 +97,6 @@ namespace Informer
 
             // Обработчик отрисовки
             this.Paint += SystemInfoOverlay_Paint;
-            
-            // Инициализация иконки в трее
-            InitializeTrayIcon();
 
             // Настройка таймера для обновления данных
             updateTimer = new Timer();
@@ -103,6 +120,18 @@ namespace Informer
                     configWatcher.NotifyFilter = NotifyFilters.LastWrite;
                     configWatcher.Changed += (s, e) =>
                     {
+                        DateTime now = DateTime.Now;
+                        
+                        // Игнорируем события FileSystemWatcher в течение 5 секунд после сохранения из формы
+                        // Это предотвращает бесконечный цикл, но позволяет подхватывать ручные правки конфига
+                        if ((now - lastFormSaveTime).TotalSeconds < 5.0)
+                            return;
+                        
+                        // Защита от множественных срабатываний (не чаще раза в секунду)
+                        if ((now - lastConfigUpdateTime).TotalSeconds < 1.0)
+                            return;
+                        lastConfigUpdateTime = now;
+                        
                         // Используем таймер для задержки вместо Thread.Sleep
                         System.Threading.Timer delayTimer = null;
                         delayTimer = new System.Threading.Timer((state) =>
@@ -110,17 +139,38 @@ namespace Informer
                             delayTimer?.Dispose();
                             if (this.IsHandleCreated && !this.IsDisposed)
                             {
+                                // Проверяем еще раз, не было ли сохранения из формы
+                                if ((DateTime.Now - lastFormSaveTime).TotalSeconds < 5.0)
+                                    return;
+                                
                                 this.BeginInvoke((MethodInvoker)delegate {
                                     try
                                     {
                                         Settings.LoadSettings();
+                                        if (!ApplySettingsIfChanged())
+                                        {
+                                            return;
+                                        }
+                                        ReRenderFromCache();
+                                        
+                                        // Обновляем размер окна, если изменились настройки размера
+                                        int newWidth = Settings.WindowWidth > 0 ? Settings.WindowWidth : 300;
+                                        int newHeight = Settings.WindowHeight > 0 ? Settings.WindowHeight : 200;
+                                        if (Math.Abs(this.Width - newWidth) > 1 || Math.Abs(this.Height - newHeight) > 1)
+                                        {
+                                            this.SuspendLayout();
+                                            this.Size = new Size(newWidth, newHeight);
+                                            this.ResumeLayout(false);
+                                        }
+                                        
                                         InvalidateCache();
-                                        this.Invalidate();
+                                        // UpdateSystemInfoAsync() сам вызовет Invalidate() когда данные будут готовы
+                                        UpdateSystemInfoAsync();
                                     }
                                     catch { }
                                 });
                             }
-                        }, null, 200, System.Threading.Timeout.Infinite);
+                        }, null, 500, System.Threading.Timeout.Infinite); // Задержка 500мс
                     };
                     configWatcher.EnableRaisingEvents = true;
 
@@ -139,16 +189,44 @@ namespace Informer
                     {
                         try
                         {
+                            DateTime now = DateTime.Now;
+                            
+                            // Игнорируем проверку в течение 5 секунд после сохранения из формы
+                            if ((now - lastFormSaveTime).TotalSeconds < 5.0)
+                                return;
+                            
                             if (File.Exists(configPath))
                             {
                                 DateTime currentWriteTime = File.GetLastWriteTime(configPath);
                                 if (currentWriteTime != lastConfigWriteTime)
                                 {
+                                    // Защита от множественных срабатываний
+                                    if ((now - lastConfigUpdateTime).TotalSeconds < 1.0)
+                                        return;
+                                    lastConfigUpdateTime = now;
+                                    
                                     lastConfigWriteTime = currentWriteTime;
                                     ConfigurationManager.RefreshSection("appSettings");
                                     Settings.LoadSettings();
-                                    InvalidateCache();
-                                    this.Invalidate();
+                                    if (!ApplySettingsIfChanged())
+                                    {
+                                        return;
+                                    }
+                                    ReRenderFromCache();
+                                    
+                                    // Обновляем размер окна, если изменились настройки размера
+                                    int newWidth = Settings.WindowWidth > 0 ? Settings.WindowWidth : 300;
+                                    int newHeight = Settings.WindowHeight > 0 ? Settings.WindowHeight : 200;
+                                        if (Math.Abs(this.Width - newWidth) > 1 || Math.Abs(this.Height - newHeight) > 1)
+                                        {
+                                            this.SuspendLayout();
+                                            this.Size = new Size(newWidth, newHeight);
+                                            this.ResumeLayout(false);
+                                        }
+                                        
+                                        InvalidateCache();
+                                    // UpdateSystemInfoAsync() сам вызовет Invalidate() когда данные будут готовы
+                                    UpdateSystemInfoAsync();
                                 }
                             }
                         }
@@ -167,24 +245,66 @@ namespace Informer
             
             // Принудительно обновляем окно для показа "Загрузка..." сразу
             this.Invalidate();
-            this.Update(); // Принудительно обновляем окно сразу
             
             // Инициализация экспорта в Aspia при запуске
             AspiaExporter.CheckAndUpdate();
+            
+            // Инициализация иконки в трее
+            InitializeTrayIcon();
         }
 
         private void SystemInfoOverlay_Paint(object sender, PaintEventArgs e)
         {
             try
             {
+                if (useLayeredWindow)
+                {
+                    // Для layered window рисуем только через UpdateLayeredWindow
+                    return;
+                }
+
                 string systemInfo = GetSystemInfo();
                 bool isLoading = string.IsNullOrEmpty(systemInfo);
+                if (!isLoading)
+                {
+                    lock (bitmapLock)
+                    {
+                        if (cachedBitmap != null)
+                        {
+                            e.Graphics.DrawImageUnscaled(cachedBitmap, 0, 0);
+                            return;
+                        }
+                    }
+                }
                 if (isLoading)
                 {
-                    // Если данных нет, показываем анимированную заглушку
+                    // Если данных нет, показываем анимированную заглушку по центру
                     string dots = new string('.', loadingDotsCount);
-                    systemInfo = "Загрузка" + dots;
+                    string loadingText = "Загрузка" + dots;
+
+                    using (Font font = new Font(Settings.FontName, Settings.FontSize,
+                        (Settings.FontBold ? FontStyle.Bold : FontStyle.Regular)
+                        | (Settings.FontItalic ? FontStyle.Italic : FontStyle.Regular)
+                        | (Settings.FontUnderline ? FontStyle.Underline : FontStyle.Regular)))
+                    {
+                        e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+                        e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                        e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+
+                        SizeF textSize = e.Graphics.MeasureString(loadingText, font);
+                        float x = (this.Width - textSize.Width) / 2f;
+                        float y = (this.Height - textSize.Height) / 2f;
+
+                        Color textColor = Settings.TextColor;
+                        textColor = Color.FromArgb(loadingPulseAlpha, textColor.R, textColor.G, textColor.B);
+                        using (SolidBrush textBrush = new SolidBrush(textColor))
+                        {
+                            e.Graphics.DrawString(loadingText, font, textBrush, x, y);
+                        }
+                    }
+                    return;
                 }
+
                 string[] lines = systemInfo.Split(new[] { Environment.NewLine }, StringSplitOptions.None);
                 if (lines.Length == 0 || e == null || e.Graphics == null)
                 {
@@ -248,6 +368,28 @@ namespace Informer
             }
         }
 
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            // Отключаем стандартную заливку фона, чтобы избежать мерцания
+            // Фон рисуется в OnPaint поверх прозрачности.
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (useLayeredWindow)
+            {
+                const int WM_PAINT = 0x000F;
+                const int WM_ERASEBKGND = 0x0014;
+                if (m.Msg == WM_ERASEBKGND || m.Msg == WM_PAINT)
+                {
+                    m.Result = IntPtr.Zero;
+                    return;
+                }
+            }
+
+            base.WndProc(ref m);
+        }
+
         private void LoadingAnimationTimer_Tick(object sender, EventArgs e)
         {
             // Анимация точек загрузки (0, 1, 2, 3 точки)
@@ -280,7 +422,7 @@ namespace Informer
                 {
                     if (this.IsHandleCreated && !this.IsDisposed)
                     {
-                        this.BeginInvoke((MethodInvoker)delegate { this.Invalidate(); });
+                        QueueRender("");
                     }
                 }
             }
@@ -293,58 +435,70 @@ namespace Informer
             
             // Проверяем изменения в сетевых настройках для Aspia
             AspiaExporter.CheckAndUpdate();
-            
-            this.Invalidate();
         }
         
         private string GetSystemInfo()
         {
             lock (cacheLock)
             {
-                // Если кэш свежий (обновлен менее 1 секунды назад), используем его
-                if (!string.IsNullOrEmpty(cachedSystemInfo) && 
-                    (DateTime.Now - lastUpdateTime).TotalSeconds < 1.0)
+                // Всегда используем кэш, даже если он устарел
+                // Это предотвращает блокировку UI потока синхронным BuildSystemInfo()
+                // Если кэш пустой или устарел, показываем "Загрузка..."
+                if (!string.IsNullOrEmpty(cachedSystemInfo))
                 {
                     return cachedSystemInfo;
                 }
             }
             
-            // Если кэш устарел, строим синхронно (но это должно быть редко)
-            return BuildSystemInfo();
+            // Если кэш пустой, возвращаем пустую строку (будет показано "Загрузка...")
+            return "";
         }
         
         private void UpdateSystemInfoAsync()
         {
             // Предотвращаем параллельные обновления
-            if (isUpdating) return;
+            if (System.Threading.Interlocked.CompareExchange(ref isUpdating, 1, 0) != 0)
+            {
+                return;
+            }
             
             System.Threading.ThreadPool.QueueUserWorkItem((state) =>
             {
                 try
                 {
-                    isUpdating = true;
                     string newInfo = BuildSystemInfo();
-                    
+                    bool isChanged = false;
                     lock (cacheLock)
                     {
-                        cachedSystemInfo = newInfo;
-                        lastUpdateTime = DateTime.Now;
+                        isChanged = !string.Equals(cachedSystemInfo, newInfo, StringComparison.Ordinal);
+                        if (isChanged)
+                        {
+                            cachedSystemInfo = newInfo;
+                            lastUpdateTime = DateTime.Now;
+                        }
                     }
                     
                     // Обновляем UI
-                    if (this.IsHandleCreated && !this.IsDisposed)
+                    if (this.IsHandleCreated && !this.IsDisposed && (isChanged || forceRepaint))
                     {
+                        string infoToRender = newInfo;
                         this.BeginInvoke((MethodInvoker)delegate 
                         { 
-                            this.Invalidate(); 
-                            this.Update(); // Принудительно обновляем окно для показа загрузки
+                            // Защита от частых обновлений (не чаще раза в 300мс)
+                            DateTime now = DateTime.Now;
+                            if ((now - lastInvalidateTime).TotalSeconds >= 0.3)
+                            {
+                                lastInvalidateTime = now;
+                                forceRepaint = false;
+                                QueueRender(infoToRender);
+                            }
                         });
                     }
                 }
                 catch { }
                 finally
                 {
-                    isUpdating = false;
+                    System.Threading.Interlocked.Exchange(ref isUpdating, 0);
                 }
             });
         }
@@ -353,9 +507,327 @@ namespace Informer
         {
             lock (cacheLock)
             {
-                cachedSystemInfo = "";
+                // Не очищаем кэш полностью, а помечаем как устаревший
+                // Это предотвратит показ черного окна или "Загрузка..." при обновлении настроек
                 lastUpdateTime = DateTime.MinValue;
             }
+
+            lock (bitmapLock)
+            {
+                cachedBitmap?.Dispose();
+                cachedBitmap = null;
+            }
+        }
+
+        private void ApplyUpdateInterval()
+        {
+            if (updateTimer != null)
+            {
+                int interval = Settings.UpdateInterval;
+                if (interval < 1000)
+                {
+                    interval = 1000;
+                }
+                updateTimer.Interval = interval;
+            }
+        }
+
+        private void ReRenderFromCache()
+        {
+            string info;
+            lock (cacheLock)
+            {
+                info = cachedSystemInfo;
+            }
+            QueueRender(info);
+        }
+
+        private void QueueRender(string info)
+        {
+            lock (renderLock)
+            {
+                queuedRenderInfo = info ?? "";
+                if (renderQueued)
+                {
+                    return;
+                }
+                renderQueued = true;
+            }
+
+            if (this.IsHandleCreated && !this.IsDisposed)
+            {
+                this.BeginInvoke((MethodInvoker)delegate
+                {
+                    string infoToRender;
+                    lock (renderLock)
+                    {
+                        infoToRender = queuedRenderInfo;
+                        renderQueued = false;
+                    }
+                    RenderCachedBitmap(infoToRender);
+                    if (!useLayeredWindow)
+                    {
+                        this.Invalidate();
+                    }
+                });
+            }
+        }
+
+        private void RenderCachedBitmap(string systemInfo)
+        {
+            try
+            {
+                int width = Math.Max(1, this.ClientSize.Width);
+                int height = Math.Max(1, this.ClientSize.Height);
+                Bitmap newBitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+                using (Graphics g = Graphics.FromImage(newBitmap))
+                {
+                    g.Clear(Color.Transparent);
+                    if (string.IsNullOrEmpty(systemInfo))
+                    {
+                        DrawLoadingCentered(g);
+                    }
+                    else
+                    {
+                        DrawSystemInfo(g, systemInfo);
+                    }
+                }
+
+                lock (bitmapLock)
+                {
+                    cachedBitmap?.Dispose();
+                    cachedBitmap = newBitmap;
+                }
+                
+                if (useLayeredWindow && this.IsHandleCreated && !this.IsDisposed)
+                {
+                    UpdateLayeredWindowFromBitmap(newBitmap);
+                }
+            }
+            catch { }
+        }
+
+        private void DrawLoadingCentered(Graphics g)
+        {
+            try
+            {
+                string dots = new string('.', loadingDotsCount);
+                string loadingText = "Загрузка" + dots;
+                using (Font font = new Font(Settings.FontName, Settings.FontSize,
+                    (Settings.FontBold ? FontStyle.Bold : FontStyle.Regular)
+                    | (Settings.FontItalic ? FontStyle.Italic : FontStyle.Regular)
+                    | (Settings.FontUnderline ? FontStyle.Underline : FontStyle.Regular)))
+                {
+                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+
+                    SizeF textSize = g.MeasureString(loadingText, font);
+                    float x = (this.Width - textSize.Width) / 2f;
+                    float y = (this.Height - textSize.Height) / 2f;
+
+                    Color textColor = Settings.TextColor;
+                    textColor = Color.FromArgb(loadingPulseAlpha, textColor.R, textColor.G, textColor.B);
+                    using (SolidBrush textBrush = new SolidBrush(textColor))
+                    {
+                        g.DrawString(loadingText, font, textBrush, x, y);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void DrawSystemInfo(Graphics g, string systemInfo)
+        {
+            try
+            {
+                string[] lines = systemInfo.Split(new[] { Environment.NewLine }, StringSplitOptions.None);
+                if (lines.Length == 0)
+                    return;
+
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+
+                using (Font font = new Font(Settings.FontName, Settings.FontSize,
+                    (Settings.FontBold ? FontStyle.Bold : FontStyle.Regular)
+                    | (Settings.FontItalic ? FontStyle.Italic : FontStyle.Regular)
+                    | (Settings.FontUnderline ? FontStyle.Underline : FontStyle.Regular)))
+                {
+                    int rightPadding = 10;
+                    float maxWidth = 0;
+                    foreach (string line in lines)
+                    {
+                        SizeF lineSize = g.MeasureString(line, font);
+                        if (lineSize.Width > maxWidth)
+                            maxWidth = lineSize.Width;
+                    }
+                    float x = this.Width - maxWidth - rightPadding;
+                    float y = 10;
+                    foreach (string line in lines)
+                    {
+                        // Тень
+                        if (Settings.ShadowEnabled && Settings.ShadowLayers > 0)
+                        {
+                            Color baseShadowColor = Settings.ShadowColor;
+                            if (baseShadowColor.A != Settings.ShadowAlpha)
+                            {
+                                baseShadowColor = Color.FromArgb(Settings.ShadowAlpha, baseShadowColor.R, baseShadowColor.G, baseShadowColor.B);
+                            }
+                            using (SolidBrush shadowBrush = new SolidBrush(baseShadowColor))
+                            {
+                                for (int i = 1; i <= Settings.ShadowLayers; i++)
+                                {
+                                    int offset = Settings.ShadowOffset * i;
+                                    g.DrawString(line, font, shadowBrush, x + offset, y + offset);
+                                }
+                            }
+                        }
+                        // Текст
+                        using (SolidBrush textBrush = new SolidBrush(Settings.TextColor))
+                        {
+                            g.DrawString(line, font, textBrush, x, y);
+                        }
+                        y += font.Height;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                if (useLayeredWindow)
+                {
+                    cp.ExStyle |= 0x80000; // WS_EX_LAYERED
+                }
+                return cp;
+            }
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize, IntPtr hdcSrc, ref POINT pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr GetDC(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool DeleteDC(IntPtr hdc);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
+
+        [DllImport("gdi32.dll", SetLastError = true)]
+        private static extern bool DeleteObject(IntPtr hObject);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+            public POINT(int x, int y) { X = x; Y = y; }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SIZE
+        {
+            public int CX;
+            public int CY;
+            public SIZE(int cx, int cy) { CX = cx; CY = cy; }
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        private struct BLENDFUNCTION
+        {
+            public byte BlendOp;
+            public byte BlendFlags;
+            public byte SourceConstantAlpha;
+            public byte AlphaFormat;
+        }
+
+        private void UpdateLayeredWindowFromBitmap(Bitmap bitmap)
+        {
+            IntPtr screenDc = IntPtr.Zero;
+            IntPtr memDc = IntPtr.Zero;
+            IntPtr hBitmap = IntPtr.Zero;
+            IntPtr oldBitmap = IntPtr.Zero;
+            try
+            {
+                screenDc = GetDC(IntPtr.Zero);
+                memDc = CreateCompatibleDC(screenDc);
+                hBitmap = bitmap.GetHbitmap(Color.FromArgb(0));
+                oldBitmap = SelectObject(memDc, hBitmap);
+
+                SIZE size = new SIZE(bitmap.Width, bitmap.Height);
+                POINT pointSource = new POINT(0, 0);
+                POINT topPos = new POINT(this.Left, this.Top);
+                BLENDFUNCTION blend = new BLENDFUNCTION
+                {
+                    BlendOp = 0x00,
+                    BlendFlags = 0,
+                    SourceConstantAlpha = 255,
+                    AlphaFormat = 0x01 // AC_SRC_ALPHA
+                };
+
+                UpdateLayeredWindow(this.Handle, screenDc, ref topPos, ref size, memDc, ref pointSource, 0, ref blend, 0x02);
+            }
+            catch { }
+            finally
+            {
+                if (oldBitmap != IntPtr.Zero && memDc != IntPtr.Zero)
+                    SelectObject(memDc, oldBitmap);
+                if (hBitmap != IntPtr.Zero)
+                    DeleteObject(hBitmap);
+                if (memDc != IntPtr.Zero)
+                    DeleteDC(memDc);
+                if (screenDc != IntPtr.Zero)
+                    ReleaseDC(IntPtr.Zero, screenDc);
+            }
+        }
+
+        private bool ApplySettingsIfChanged()
+        {
+            string signature = GetSettingsSignature();
+            if (string.Equals(signature, lastSettingsSignature, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            lastSettingsSignature = signature;
+            forceRepaint = true;
+            ApplyUpdateInterval();
+            return true;
+        }
+
+        private string GetSettingsSignature()
+        {
+            return string.Join("|", new[]
+            {
+                Settings.WindowWidth.ToString(),
+                Settings.WindowHeight.ToString(),
+                Settings.FontName ?? "",
+                Settings.FontSize.ToString(),
+                Settings.FontBold.ToString(),
+                Settings.FontItalic.ToString(),
+                Settings.FontUnderline.ToString(),
+                Settings.TextColor.ToArgb().ToString(),
+                Settings.ShadowEnabled.ToString(),
+                Settings.ShadowColor.ToArgb().ToString(),
+                Settings.ShadowAlpha.ToString(),
+                Settings.ShadowOffset.ToString(),
+                Settings.ShadowLayers.ToString(),
+                Settings.UpdateInterval.ToString(),
+                Settings.MaxLineLength.ToString()
+            });
         }
 
         private string BuildSystemInfo()
@@ -494,8 +966,15 @@ namespace Informer
                         totalHeight += (int)font.Height;
                     }
                     
-                    // Устанавливаем размер окна
-                    this.Size = new Size(Settings.WindowWidth, totalHeight);
+                    // Устанавливаем размер окна с защитой от лишних перерисовок
+                    int newWidth = Settings.WindowWidth;
+                    int newHeight = totalHeight;
+                    if (Math.Abs(this.Width - newWidth) > 1 || Math.Abs(this.Height - newHeight) > 1)
+                    {
+                        this.SuspendLayout();
+                        this.Size = new Size(newWidth, newHeight);
+                        this.ResumeLayout(false);
+                    }
                     
                     // Позиционируем окно в правом нижнем углу
                     Screen screen = Screen.PrimaryScreen;
@@ -859,10 +1338,31 @@ namespace Informer
         {
             try
             {
-                string iconPath = Path.Combine(Application.StartupPath, "Informer.ico");
-                if (File.Exists(iconPath))
+                // Пробуем получить иконку из самого exe файла
+                string exePath = Application.ExecutablePath;
+                if (File.Exists(exePath))
                 {
-                    return new Icon(iconPath);
+                    Icon appIcon = Icon.ExtractAssociatedIcon(exePath);
+                    if (appIcon != null)
+                    {
+                        return appIcon;
+                    }
+                }
+                
+                // Если не получилось, пробуем найти иконку в разных местах
+                string[] possiblePaths = new[]
+                {
+                    Path.Combine(Application.StartupPath, "informer.ico"),
+                    Path.Combine(Application.StartupPath, "icon_informer.ico"),
+                    Path.Combine(Application.StartupPath, "Informer.ico")
+                };
+                
+                foreach (string iconPath in possiblePaths)
+                {
+                    if (File.Exists(iconPath))
+                    {
+                        return new Icon(iconPath);
+                    }
                 }
             }
             catch { }
@@ -923,11 +1423,79 @@ namespace Informer
             {
                 using (SettingsForm settingsForm = new SettingsForm())
                 {
-                    if (settingsForm.ShowDialog() == DialogResult.OK)
+                    bool wasVisible = this.Visible;
+                    bool wasTopMost = this.TopMost;
+                    try
                     {
-                        // Настройки сохранены, обновляем кэш и перерисовываем
+                        // Прячем оверлей, чтобы он не мешал модальным диалогам (ColorDialog)
+                        this.TopMost = false;
+                        this.Hide();
+                    }
+                    catch { }
+
+                    DialogResult result;
+                    try
+                    {
+                        result = settingsForm.ShowDialog();
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            if (wasVisible)
+                            {
+                                this.Show();
+                            }
+                            this.TopMost = wasTopMost;
+                        }
+                        catch { }
+                    }
+
+                    if (result == DialogResult.OK)
+                    {
+                        // Настройки уже сохранены в SettingsForm
+                        // Запоминаем время сохранения - FileSystemWatcher будет игнорировать события в течение 3 секунд
+                        lastFormSaveTime = DateTime.Now;
+                        
+                        // Обновляем время последнего изменения файла, чтобы таймер не сработал сразу
+                        try
+                        {
+                            string configPath = AppDomain.CurrentDomain.SetupInformation.ConfigurationFile;
+                            if (File.Exists(configPath))
+                            {
+                                lastConfigWriteTime = File.GetLastWriteTime(configPath);
+                            }
+                        }
+                        catch { }
+                        
+                        // Небольшая задержка для стабилизации файла
+                        System.Threading.Thread.Sleep(100);
+                        
+                        // Обновляем настройки
+                        ConfigurationManager.RefreshSection("appSettings");
+                        Settings.LoadSettings();
+                        ApplySettingsIfChanged();
+                        ReRenderFromCache();
+                        
+                        // Обновляем размер окна, если изменились настройки размера
+                        // НО только если размер действительно изменился, чтобы избежать лишних перерисовок
+                        int newWidth = Settings.WindowWidth > 0 ? Settings.WindowWidth : 300;
+                        int newHeight = Settings.WindowHeight > 0 ? Settings.WindowHeight : 200;
+                        if (Math.Abs(this.Width - newWidth) > 1 || Math.Abs(this.Height - newHeight) > 1)
+                        {
+                            // Используем SuspendLayout/ResumeLayout для предотвращения множественных перерисовок
+                            this.SuspendLayout();
+                            this.Size = new Size(newWidth, newHeight);
+                            this.ResumeLayout(false);
+                        }
+                        
+                        // Помечаем кэш как устаревший, но не очищаем его полностью
+                        // Это позволит окну продолжать показывать данные во время обновления
                         InvalidateCache();
-                        this.Invalidate();
+                        
+                        // Запускаем обновление кэша в фоне
+                        // UpdateSystemInfoAsync() сам вызовет Invalidate() когда данные будут готовы
+                        UpdateSystemInfoAsync();
                     }
                 }
             }
@@ -983,6 +1551,12 @@ namespace Informer
                     configWatcher.EnableRaisingEvents = false;
                     configWatcher.Dispose();
                     configWatcher = null;
+                }
+
+                lock (bitmapLock)
+                {
+                    cachedBitmap?.Dispose();
+                    cachedBitmap = null;
                 }
                 
                 // Освобождаем иконку в трее

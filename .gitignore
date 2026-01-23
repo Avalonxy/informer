@@ -81,6 +81,10 @@ InformerMSI/*.exe
 InformerMSI/*.pdb
 InformerMSI/Informer.exe
 InformerMSI/Informer.exe.config
+InformerMSI/informer.gpo.wxs
+InformerMSI/Informer.ico
+InformerMSI/UpdateConfig.cs
+InformerMSI/UpdateConfig.csproj
 
 # Temporary files
 *.tmp
@@ -91,3 +95,6 @@ InformerMSI/Informer.exe.config
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Library files
+*.lib

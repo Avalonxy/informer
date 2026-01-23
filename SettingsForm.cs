@@ -2,6 +2,7 @@ using System;
 using System.ComponentModel;
 using System.Drawing;
 using System.IO;
+using System.Drawing.Text;
 using System.Windows.Forms;
 using System.Configuration;
 using System.Xml;
@@ -13,7 +14,7 @@ namespace Informer
     {
         private TextBox txtWindowWidth;
         private TextBox txtWindowHeight;
-        private TextBox txtFontName;
+        private ComboBox cmbFontName;
         private TextBox txtFontSize;
         private CheckBox chkFontBold;
         private CheckBox chkFontItalic;
@@ -112,10 +113,12 @@ namespace Informer
             
             // Настройки шрифта
             AddLabeledControl("Имя шрифта:", 10, yPos, labelWidth, out Label lblFontName);
-            txtFontName = new TextBox();
-            txtFontName.Location = new Point(220, yPos);
-            txtFontName.Size = new Size(controlWidth, 23);
-            this.Controls.Add(txtFontName);
+            cmbFontName = new ComboBox();
+            cmbFontName.Location = new Point(220, yPos);
+            cmbFontName.Size = new Size(controlWidth, 23);
+            cmbFontName.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbFontName.MaxDropDownItems = 15;
+            this.Controls.Add(cmbFontName);
             yPos += spacing;
             
             AddLabeledControl("Размер шрифта:", 10, yPos, labelWidth, out Label lblFontSize);
@@ -240,6 +243,8 @@ namespace Informer
             btnCancel.Size = new Size(100, 30);
             btnCancel.Click += BtnCancel_Click;
             this.Controls.Add(btnCancel);
+
+            LoadInstalledFonts();
         }
         
         private void AddLabeledControl(string labelText, int x, int y, int width, out Label label)
@@ -257,7 +262,7 @@ namespace Informer
             try
             {
                 // Проверяем, что все элементы формы инициализированы
-                if (txtWindowWidth == null || txtWindowHeight == null || txtFontName == null || 
+                if (txtWindowWidth == null || txtWindowHeight == null || cmbFontName == null || 
                     txtFontSize == null || chkFontBold == null || chkFontItalic == null || 
                     chkFontUnderline == null || txtTextColor == null || chkShadowEnabled == null ||
                     txtShadowColor == null || txtShadowAlpha == null || txtUpdateInterval == null ||
@@ -268,7 +273,7 @@ namespace Informer
                 
                 txtWindowWidth.Text = Settings.WindowWidth.ToString();
                 txtWindowHeight.Text = Settings.WindowHeight.ToString();
-                txtFontName.Text = Settings.FontName ?? "";
+                SetSelectedFontName(Settings.FontName ?? "");
                 txtFontSize.Text = Settings.FontSize.ToString();
                 chkFontBold.Checked = Settings.FontBold;
                 chkFontItalic.Checked = Settings.FontItalic;
@@ -320,86 +325,100 @@ namespace Informer
         
         private void BtnTextColorPicker_Click(object sender, EventArgs e)
         {
-            ColorDialog colorDialog = new ColorDialog();
-            try
+            using (ColorDialog colorDialog = new ColorDialog())
             {
-                // Пытаемся распарсить цвет из текстового поля
-                if (!string.IsNullOrEmpty(txtTextColor.Text))
+                try
                 {
-                    if (txtTextColor.Text.Contains(","))
+                    // Пытаемся распарсить цвет из текстового поля
+                    if (!string.IsNullOrEmpty(txtTextColor.Text))
                     {
-                        string[] parts = txtTextColor.Text.Split(',');
-                        if (parts.Length == 4 && int.TryParse(parts[0], out int a) && 
-                            int.TryParse(parts[1], out int r) && int.TryParse(parts[2], out int g) && 
-                            int.TryParse(parts[3], out int b))
+                        if (txtTextColor.Text.Contains(","))
                         {
-                            colorDialog.Color = Color.FromArgb(a, r, g, b);
+                            string[] parts = txtTextColor.Text.Split(',');
+                            if (parts.Length == 4 && int.TryParse(parts[0], out int a) && 
+                                int.TryParse(parts[1], out int r) && int.TryParse(parts[2], out int g) && 
+                                int.TryParse(parts[3], out int b))
+                            {
+                                colorDialog.Color = Color.FromArgb(a, r, g, b);
+                            }
+                        }
+                        else
+                        {
+                            colorDialog.Color = Color.FromName(txtTextColor.Text);
                         }
                     }
                     else
                     {
-                        colorDialog.Color = Color.FromName(txtTextColor.Text);
+                        colorDialog.Color = Settings.TextColor;
                     }
                 }
-                else
+                catch
                 {
                     colorDialog.Color = Settings.TextColor;
                 }
-            }
-            catch
-            {
-                colorDialog.Color = Settings.TextColor;
-            }
-            
-            if (colorDialog.ShowDialog() == DialogResult.OK)
-            {
-                if (colorDialog.Color.IsKnownColor)
+
+                bool wasTopMost = this.TopMost;
+                this.TopMost = true;
+                var result = colorDialog.ShowDialog(this);
+                this.TopMost = wasTopMost;
+
+                if (result == DialogResult.OK)
                 {
-                    txtTextColor.Text = colorDialog.Color.Name;
-                }
-                else
-                {
-                    txtTextColor.Text = $"{colorDialog.Color.A},{colorDialog.Color.R},{colorDialog.Color.G},{colorDialog.Color.B}";
+                    if (colorDialog.Color.IsKnownColor)
+                    {
+                        txtTextColor.Text = colorDialog.Color.Name;
+                    }
+                    else
+                    {
+                        txtTextColor.Text = $"{colorDialog.Color.A},{colorDialog.Color.R},{colorDialog.Color.G},{colorDialog.Color.B}";
+                    }
                 }
             }
         }
         
         private void BtnShadowColorPicker_Click(object sender, EventArgs e)
         {
-            ColorDialog colorDialog = new ColorDialog();
-            try
+            using (ColorDialog colorDialog = new ColorDialog())
             {
-                // Пытаемся распарсить цвет из текстового поля
-                if (!string.IsNullOrEmpty(txtShadowColor.Text))
+                try
                 {
-                    if (txtShadowColor.Text.Contains(","))
+                    // Пытаемся распарсить цвет из текстового поля
+                    if (!string.IsNullOrEmpty(txtShadowColor.Text))
                     {
-                        string[] parts = txtShadowColor.Text.Split(',');
-                        if (parts.Length == 4 && int.TryParse(parts[0], out int a) && 
-                            int.TryParse(parts[1], out int r) && int.TryParse(parts[2], out int g) && 
-                            int.TryParse(parts[3], out int b))
+                        if (txtShadowColor.Text.Contains(","))
                         {
-                            colorDialog.Color = Color.FromArgb(a, r, g, b);
+                            string[] parts = txtShadowColor.Text.Split(',');
+                            if (parts.Length == 4 && int.TryParse(parts[0], out int a) && 
+                                int.TryParse(parts[1], out int r) && int.TryParse(parts[2], out int g) && 
+                                int.TryParse(parts[3], out int b))
+                            {
+                                colorDialog.Color = Color.FromArgb(a, r, g, b);
+                            }
+                        }
+                        else
+                        {
+                            colorDialog.Color = Color.FromName(txtShadowColor.Text);
                         }
                     }
                     else
                     {
-                        colorDialog.Color = Color.FromName(txtShadowColor.Text);
+                        colorDialog.Color = Settings.ShadowColor;
                     }
                 }
-                else
+                catch
                 {
                     colorDialog.Color = Settings.ShadowColor;
                 }
-            }
-            catch
-            {
-                colorDialog.Color = Settings.ShadowColor;
-            }
-            
-            if (colorDialog.ShowDialog() == DialogResult.OK)
-            {
-                txtShadowColor.Text = $"{colorDialog.Color.A},{colorDialog.Color.R},{colorDialog.Color.G},{colorDialog.Color.B}";
+
+                bool wasTopMost = this.TopMost;
+                this.TopMost = true;
+                var result = colorDialog.ShowDialog(this);
+                this.TopMost = wasTopMost;
+
+                if (result == DialogResult.OK)
+                {
+                    txtShadowColor.Text = $"{colorDialog.Color.A},{colorDialog.Color.R},{colorDialog.Color.G},{colorDialog.Color.B}";
+                }
             }
         }
         
@@ -408,8 +427,6 @@ namespace Informer
             try
             {
                 SaveSettings();
-                MessageBox.Show("Настройки сохранены. Изменения применятся автоматически.", 
-                    "Настройки", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 this.DialogResult = DialogResult.OK;
                 this.Close();
             }
@@ -475,7 +492,8 @@ namespace Informer
             // Сохраняем настройки
             setKey("WindowWidth", txtWindowWidth.Text);
             setKey("WindowHeight", txtWindowHeight.Text);
-            setKey("FontName", txtFontName.Text);
+            string selectedFont = cmbFontName.SelectedItem != null ? cmbFontName.SelectedItem.ToString() : cmbFontName.Text;
+            setKey("FontName", selectedFont);
             setKey("FontSize", txtFontSize.Text);
             setKey("FontBold", chkFontBold.Checked.ToString().ToLower());
             setKey("FontItalic", chkFontItalic.Checked.ToString().ToLower());
@@ -512,6 +530,43 @@ namespace Informer
             // Обновляем настройки в памяти
             ConfigurationManager.RefreshSection("appSettings");
             Settings.LoadSettings();
+        }
+
+        private void LoadInstalledFonts()
+        {
+            try
+            {
+                InstalledFontCollection fonts = new InstalledFontCollection();
+                foreach (FontFamily family in fonts.Families)
+                {
+                    cmbFontName.Items.Add(family.Name);
+                }
+            }
+            catch
+            {
+                // Если список шрифтов получить не удалось, оставляем поле пустым
+            }
+        }
+
+        private void SetSelectedFontName(string fontName)
+        {
+            if (string.IsNullOrWhiteSpace(fontName))
+            {
+                cmbFontName.SelectedIndex = -1;
+                cmbFontName.Text = "";
+                return;
+            }
+
+            int index = cmbFontName.FindStringExact(fontName);
+            if (index >= 0)
+            {
+                cmbFontName.SelectedIndex = index;
+            }
+            else
+            {
+                cmbFontName.SelectedIndex = -1;
+                cmbFontName.Text = fontName;
+            }
         }
     }
 }
