@@ -2,7 +2,7 @@
 
 **Informer** — это приложение для Windows, которое отображает системную информацию в виде полупрозрачного оверлея на рабочем столе. Приложение работает в фоновом режиме и предоставляет быстрый доступ к ключевым данным о системе.
 
-![Version](https://img.shields.io/badge/version-1.3.1.161-blue)
+![Version](https://img.shields.io/badge/version-1.3.1.162-blue)
 ![.NET](https://img.shields.io/badge/.NET-Framework%204.6-purple)
 ![License](https://img.shields.io/badge/license-All%20rights%20reserved-red)
 
